@@ -7051,6 +7051,32 @@ def test_s3_bucket_versioning(s3):
     assert resp["Status"] == "Enabled"
 
 
+def test_s3_put_object_returns_version_id(s3):
+    """PutObject on a versioned bucket must return a VersionId."""
+    bucket = "intg-s3-put-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    resp = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"v1")
+    assert "VersionId" in resp, "PutObject must return VersionId for versioned bucket"
+    vid = resp["VersionId"]
+    assert vid and vid != "null", "VersionId must be a non-null identifier"
+
+    # A second put must produce a different version id
+    resp2 = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"v2")
+    assert resp2["VersionId"] != vid, "Each put must produce a unique VersionId"
+
+
+def test_s3_put_object_no_version_id_without_versioning(s3):
+    """PutObject on a non-versioned bucket must NOT return a VersionId."""
+    bucket = "intg-s3-put-noversion"
+    s3.create_bucket(Bucket=bucket)
+    resp = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"data")
+    assert "VersionId" not in resp
+
+
 def test_s3_bucket_encryption(s3):
     s3.create_bucket(Bucket="intg-s3-enc")
     s3.put_bucket_encryption(

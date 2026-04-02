@@ -241,6 +241,16 @@ def _extract_user_metadata(headers: dict) -> dict:
     return meta
 
 
+def _generate_version_id(bucket_name: str) -> str | None:
+    """Return a new version id when the bucket has versioning enabled, else *None*."""
+    status = _bucket_versioning.get(bucket_name, "")
+    if status == "Enabled":
+        return new_uuid()
+    if status == "Suspended":
+        return "null"
+    return None
+
+
 def _build_object_record(body: bytes, headers: dict) -> dict:
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -275,6 +285,9 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") ->
     for k, val in obj.get("preserved_headers", {}).items():
         h[k] = val
     h.update(obj.get("metadata", {}))
+    vid = obj.get("version_id")
+    if vid is not None:
+        h["x-amz-version-id"] = vid
     if bucket_name and key:
         retention = _object_retention.get((bucket_name, key))
         if retention:
@@ -980,7 +993,7 @@ def _list_object_versions(bucket_name: str, query_params: dict):
         obj = bucket["objects"][k]
         ver = SubElement(root, "Version")
         SubElement(ver, "Key").text = k
-        SubElement(ver, "VersionId").text = "1"
+        SubElement(ver, "VersionId").text = obj.get("version_id", "null")
         SubElement(ver, "IsLatest").text = "true"
         SubElement(ver, "LastModified").text = obj["last_modified"]
         SubElement(ver, "ETag").text = obj["etag"]
@@ -1282,7 +1295,12 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"]
     )
 
-    return 200, {"ETag": obj["etag"]}, b""
+    resp_headers = {"ETag": obj["etag"]}
+    version_id = _generate_version_id(bucket_name)
+    if version_id is not None:
+        obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
 def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
@@ -1558,7 +1576,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
     SubElement(root, "ETag").text = new_etag
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers: dict = {"Content-Type": "application/xml"}
+    version_id = _generate_version_id(bucket_name)
+    if version_id is not None:
+        dest_obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, _xml_body(root)
 
 
 # ---------------------------------------------------------------------------
@@ -2440,7 +2463,12 @@ def _complete_multipart_upload(
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers: dict = {"Content-Type": "application/xml"}
+    version_id = _generate_version_id(bucket_name)
+    if version_id is not None:
+        obj["version_id"] = version_id
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, _xml_body(root)
 
 
 def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
