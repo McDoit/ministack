@@ -7078,6 +7078,81 @@ def test_s3_put_object_no_version_id_without_versioning(s3):
     assert "VersionId" not in resp
 
 
+def test_s3_get_object_by_version_id(s3):
+    """GetObject with versionId returns the specific version content."""
+    bucket = "intg-s3-get-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    # Put two versions of the same key
+    r1 = s3.put_object(Bucket=bucket, Key="file.txt", Body=b"version-one")
+    vid1 = r1["VersionId"]
+    r2 = s3.put_object(Bucket=bucket, Key="file.txt", Body=b"version-two")
+    vid2 = r2["VersionId"]
+
+    # Default GET returns the latest version
+    latest = s3.get_object(Bucket=bucket, Key="file.txt")
+    assert latest["Body"].read() == b"version-two"
+
+    # GET with versionId for v1
+    old = s3.get_object(Bucket=bucket, Key="file.txt", VersionId=vid1)
+    assert old["Body"].read() == b"version-one"
+    assert old["VersionId"] == vid1
+
+    # GET with versionId for v2
+    cur = s3.get_object(Bucket=bucket, Key="file.txt", VersionId=vid2)
+    assert cur["Body"].read() == b"version-two"
+    assert cur["VersionId"] == vid2
+
+
+def test_s3_head_object_by_version_id(s3):
+    """HeadObject with versionId returns the metadata for a specific version."""
+    bucket = "intg-s3-head-version"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    r1 = s3.put_object(Bucket=bucket, Key="f.txt", Body=b"aaa")
+    vid1 = r1["VersionId"]
+    r2 = s3.put_object(Bucket=bucket, Key="f.txt", Body=b"bbbbbb")
+    vid2 = r2["VersionId"]
+
+    h1 = s3.head_object(Bucket=bucket, Key="f.txt", VersionId=vid1)
+    assert h1["ContentLength"] == 3
+    assert h1["VersionId"] == vid1
+
+    h2 = s3.head_object(Bucket=bucket, Key="f.txt", VersionId=vid2)
+    assert h2["ContentLength"] == 6
+    assert h2["VersionId"] == vid2
+
+
+def test_s3_list_object_versions_multiple(s3):
+    """ListObjectVersions lists all versions of an object."""
+    bucket = "intg-s3-list-versions"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+
+    r1 = s3.put_object(Bucket=bucket, Key="k.txt", Body=b"v1")
+    vid1 = r1["VersionId"]
+    r2 = s3.put_object(Bucket=bucket, Key="k.txt", Body=b"v2")
+    vid2 = r2["VersionId"]
+
+    resp = s3.list_object_versions(Bucket=bucket)
+    versions = resp.get("Versions", [])
+    version_ids = [v["VersionId"] for v in versions if v["Key"] == "k.txt"]
+    assert vid1 in version_ids
+    assert vid2 in version_ids
+    assert len(version_ids) == 2
+
+
 def test_s3_bucket_encryption(s3):
     s3.create_bucket(Bucket="intg-s3-enc")
     s3.put_bucket_encryption(

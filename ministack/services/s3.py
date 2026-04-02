@@ -74,6 +74,9 @@ _object_legal_hold: dict = {}
 
 _multipart_uploads: dict = {}
 
+# version history: (bucket_name, key) -> list[dict]  (oldest → newest, *excluding* current)
+_object_versions: dict = {}
+
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
 
@@ -251,6 +254,28 @@ def _generate_version_id(bucket_name: str) -> str | None:
     return None
 
 
+def _archive_current_version(bucket_name: str, key: str, bucket: dict):
+    """Push the current object (if any) into the version history list."""
+    obj = bucket["objects"].get(key)
+    if obj is None:
+        return
+    vid = obj.get("version_id")
+    if vid is None:
+        return  # object was written before versioning was enabled – nothing to archive
+    _object_versions.setdefault((bucket_name, key), []).append(obj)
+
+
+def _find_version(bucket_name: str, key: str, version_id: str, bucket: dict):
+    """Return the object record matching *version_id*, or *None*."""
+    current = bucket["objects"].get(key)
+    if current is not None and current.get("version_id") == version_id:
+        return current
+    for obj in _object_versions.get((bucket_name, key), []):
+        if obj.get("version_id") == version_id:
+            return obj
+    return None
+
+
 def _build_object_record(body: bytes, headers: dict) -> dict:
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -339,7 +364,7 @@ def _dispatch(
                 return _get_object_retention(bucket, key)
             if "legal-hold" in query_params:
                 return _get_object_legal_hold(bucket, key)
-            return _get_object(bucket, key, headers)
+            return _get_object(bucket, key, headers, query_params)
 
         if method == "PUT":
             if "partNumber" in query_params and "uploadId" in query_params:
@@ -366,14 +391,14 @@ def _dispatch(
             )
 
         if method == "HEAD":
-            return _head_object(bucket, key)
+            return _head_object(bucket, key, query_params)
 
         if method == "DELETE":
             if "uploadId" in query_params:
                 return _abort_multipart_upload(bucket, key, query_params)
             if "tagging" in query_params:
                 return _delete_object_tagging(bucket, key)
-            return _delete_object(bucket, key, headers)
+            return _delete_object(bucket, key, headers, query_params)
 
         return _error(
             "MethodNotAllowed",
@@ -983,18 +1008,35 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     SubElement(root, "VersionIdMarker").text = version_id_marker
     SubElement(root, "MaxKeys").text = str(max_keys)
 
-    keys = sorted(
+    # Collect all keys that have at least one version (current or archived)
+    all_keys = set(
         k for k in bucket["objects"] if k.startswith(prefix) and k > key_marker
     )
-    is_truncated = len(keys) > max_keys
+    for bk_key, versions in _object_versions.items():
+        bk, k = bk_key
+        if bk == bucket_name and k.startswith(prefix) and k > key_marker and versions:
+            all_keys.add(k)
+    keys = sorted(all_keys)
+
+    # Build flat list of (key, obj, is_latest) tuples for output
+    version_entries: list[tuple[str, dict, bool]] = []
+    for k in keys:
+        current = bucket["objects"].get(k)
+        archived = _object_versions.get((bucket_name, k), [])
+        if current is not None:
+            version_entries.append((k, current, True))
+        # Archived versions in reverse order (newest first)
+        for obj in reversed(archived):
+            version_entries.append((k, obj, False))
+
+    is_truncated = len(version_entries) > max_keys
     SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
 
-    for k in keys[:max_keys]:
-        obj = bucket["objects"][k]
+    for k, obj, is_latest in version_entries[:max_keys]:
         ver = SubElement(root, "Version")
         SubElement(ver, "Key").text = k
         SubElement(ver, "VersionId").text = obj.get("version_id", "null")
-        SubElement(ver, "IsLatest").text = "true"
+        SubElement(ver, "IsLatest").text = "true" if is_latest else "false"
         SubElement(ver, "LastModified").text = obj["last_modified"]
         SubElement(ver, "ETag").text = obj["etag"]
         SubElement(ver, "Size").text = str(obj["size"])
@@ -1274,6 +1316,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if md5_err:
         return md5_err
 
+    # Archive the current version before overwriting (versioned buckets only)
+    _archive_current_version(bucket_name, key, bucket)
+
     obj = _build_object_record(body, headers)
     bucket["objects"][key] = obj
 
@@ -1336,19 +1381,25 @@ def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
         _object_legal_hold[(bucket_name, key)] = lock_legal
 
 
-def _get_object(bucket_name: str, key: str, headers: dict):
+def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
 
-    obj = bucket["objects"][key]
+    version_id = _qp(query_params or {}, "versionId", "")
+    if version_id:
+        obj = _find_version(bucket_name, key, version_id, bucket)
+        if obj is None:
+            return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+    else:
+        if key not in bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = bucket["objects"][key]
     resp_headers = _object_response_headers(obj, bucket_name, key)
 
     range_header = headers.get("range", "")
@@ -1381,27 +1432,59 @@ def _range_error_xml(bucket_name: str, key: str) -> Element:
     return root
 
 
-def _head_object(bucket_name: str, key: str):
+def _head_object(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
 
-    obj = bucket["objects"][key]
+    version_id = _qp(query_params or {}, "versionId", "")
+    if version_id:
+        obj = _find_version(bucket_name, key, version_id, bucket)
+        if obj is None:
+            return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+    else:
+        if key not in bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        obj = bucket["objects"][key]
+
     return 200, _object_response_headers(obj, bucket_name, key), b""
 
 
-def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
+def _delete_object(bucket_name: str, key: str, headers: dict | None = None, query_params: dict | None = None):
     headers = headers or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
+
+    version_id = _qp(query_params or {}, "versionId", "")
+
+    # Delete a specific version
+    if version_id:
+        current = bucket["objects"].get(key)
+        if current is not None and current.get("version_id") == version_id:
+            lock_err = _check_object_lock(bucket_name, key, headers)
+            if lock_err:
+                return lock_err
+            bucket["objects"].pop(key, None)
+            # Promote the most recent archived version, if any
+            versions = _object_versions.get((bucket_name, key), [])
+            if versions:
+                bucket["objects"][key] = versions.pop()
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            return 204, {"x-amz-version-id": version_id}, b""
+        # Check archived versions
+        versions = _object_versions.get((bucket_name, key), [])
+        for i, obj in enumerate(versions):
+            if obj.get("version_id") == version_id:
+                versions.pop(i)
+                _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+                return 204, {"x-amz-version-id": version_id}, b""
+        return 204, {"x-amz-version-id": version_id}, b""
 
     if key in bucket["objects"]:
         lock_err = _check_object_lock(bucket_name, key, headers)
@@ -1520,6 +1603,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
 
     new_etag = src_obj["etag"]
     last_modified = now_iso()
+    # Archive the current version before overwriting (versioned buckets only)
+    _archive_current_version(bucket_name, dest_key, dest_bucket)
+
     dest_obj = {
         "body": src_obj["body"],
         "content_type": content_type,
@@ -2443,6 +2529,10 @@ def _complete_multipart_upload(
         "metadata": upload["metadata"],
         "preserved_headers": upload.get("preserved_headers", {}),
     }
+
+    # Archive the current version before overwriting (versioned buckets only)
+    _archive_current_version(bucket_name, key, bucket)
+
     bucket["objects"][key] = obj
 
     if PERSIST:
