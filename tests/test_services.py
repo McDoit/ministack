@@ -7062,7 +7062,8 @@ def test_s3_put_object_returns_version_id(s3):
     resp = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"v1")
     assert "VersionId" in resp, "PutObject must return VersionId for versioned bucket"
     vid = resp["VersionId"]
-    assert vid and vid != "null", "VersionId must be a non-null identifier"
+    assert vid, "VersionId must not be empty"
+    assert vid != "null", "VersionId must not be 'null' for an Enabled bucket"
 
     # A second put must produce a different version id
     resp2 = s3.put_object(Bucket=bucket, Key="doc.txt", Body=b"v2")
