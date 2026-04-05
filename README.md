@@ -745,9 +745,9 @@ See [`Testcontainers/java-testcontainers`](Testcontainers/java-testcontainers), 
 
 ## Community Integrations
 
-| Package | Description |
-|---------|-------------|
-| [McDoit.Aspire.Hosting.Ministack](https://www.nuget.org/packages/McDoit.Aspire.Hosting.Ministack) | .NET Aspire hosting integration for MiniStack. Source: [McDoit/aspire-hosting-ministack](https://github.com/McDoit/aspire-hosting-ministack) |
+| Repository | Description |
+|------------|-------------|
+| [McDoit/aspire-hosting-ministack](https://github.com/McDoit/aspire-hosting-ministack) | .NET Aspire hosting integration for MiniStack. |
 
 ---
 
